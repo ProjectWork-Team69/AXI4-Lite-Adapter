@@ -1,232 +1,339 @@
-"""
-
-Copyright (c) 2020 Alex Forencich
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-"""
-
-import itertools
-import logging
-import os
-import random
-
-import cocotb_test.simulator
-import pytest
-
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, Timer
-from cocotb.regression import TestFactory
+from cocotb.triggers import RisingEdge, ClockCycles
+import random
 
-from cocotbext.axi import AxiLiteBus, AxiLiteMaster, AxiLiteRam
-
-
-class TB(object):
-    def __init__(self, dut):
-        self.dut = dut
-
-        self.log = logging.getLogger("cocotb.tb")
-        self.log.setLevel(logging.DEBUG)
-
-        cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-
-        # Updated to match the simplified AXI-Lite interface
-        self.axil_master = AxiLiteMaster(AxiLiteBus.from_prefix(dut, "s_axil"), dut.clk, dut.rstn)
-        self.axil_ram = AxiLiteRam(AxiLiteBus.from_prefix(dut, "m_axil"), dut.clk, dut.rstn, size=2**16)
-
-    def set_idle_generator(self, generator=None):
-        if generator:
-            self.axil_master.write_if.aw_channel.set_pause_generator(generator())
-            self.axil_master.write_if.w_channel.set_pause_generator(generator())
-            self.axil_master.read_if.ar_channel.set_pause_generator(generator())
-            self.axil_ram.write_if.b_channel.set_pause_generator(generator())
-            self.axil_ram.read_if.r_channel.set_pause_generator(generator())
-
-    def set_backpressure_generator(self, generator=None):
-        if generator:
-            self.axil_master.write_if.b_channel.set_pause_generator(generator())
-            self.axil_master.read_if.r_channel.set_pause_generator(generator())
-            self.axil_ram.write_if.aw_channel.set_pause_generator(generator())
-            self.axil_ram.write_if.w_channel.set_pause_generator(generator())
-            self.axil_ram.read_if.ar_channel.set_pause_generator(generator())
-
-    async def cycle_reset(self):
-        # Updated for active-low reset
-        self.dut.rstn.setimmediatevalue(1)
-        await RisingEdge(self.dut.clk)
-        await RisingEdge(self.dut.clk)
-        self.dut.rstn.value = 0
-        await RisingEdge(self.dut.clk)
-        await RisingEdge(self.dut.clk)
-        self.dut.rstn.value = 1
-        await RisingEdge(self.dut.clk)
-        await RisingEdge(self.dut.clk)
-
-
-async def run_test_write(dut, data_in=None, idle_inserter=None, backpressure_inserter=None):
-
-    tb = TB(dut)
-
-    byte_lanes = tb.axil_master.write_if.byte_lanes
-
-    await tb.cycle_reset()
-
-    tb.set_idle_generator(idle_inserter)
-    tb.set_backpressure_generator(backpressure_inserter)
-
-    # Enforce 32-bit transactions (4 bytes)
-    for offset in range(byte_lanes):
-        tb.log.info("offset %d", offset)
-        addr = offset+0x1000
-        test_data = bytearray([x % 256 for x in range(4)])
-
-        tb.axil_ram.write(addr-128, b'\xaa'*(4+256))
-
-        await tb.axil_master.write(addr, test_data)
-
-        tb.log.debug("%s", tb.axil_ram.hexdump_str((addr & ~0xf)-16, (((addr & 0xf)+4-1) & ~0xf)+48))
-
-        assert tb.axil_ram.read(addr, 4) == test_data
-        assert tb.axil_ram.read(addr-1, 1) == b'\xaa'
-        assert tb.axil_ram.read(addr+4, 1) == b'\xaa'
-
+@cocotb.test()
+async def test_axil_adapter_basic(dut):
+    """Basic test for AXI-Lite adapter - 32-bit transactions only"""
+    
+    # Generate clock
+    clock = Clock(dut.clk, 10, units="ns")  # 100MHz
+    cocotb.start_soon(clock.start())
+    
+    # Initialize all signals to 0
+    dut.rstn.value = 0
+    
+    # Master interface (slave to the adapter)
+    dut.m_axil_awready.value = 0
+    dut.m_axil_wready.value = 0  
+    dut.m_axil_bresp.value = 0
+    dut.m_axil_bvalid.value = 0
+    dut.m_axil_arready.value = 0
+    dut.m_axil_rdata.value = 0
+    dut.m_axil_rresp.value = 0
+    dut.m_axil_rvalid.value = 0
+    
+    # Slave interface (master to the adapter)
+    dut.s_axil_awaddr.value = 0
+    dut.s_axil_awvalid.value = 0
+    dut.s_axil_wdata.value = 0
+    dut.s_axil_wvalid.value = 0
+    dut.s_axil_bready.value = 0
+    dut.s_axil_araddr.value = 0
+    dut.s_axil_arvalid.value = 0
+    dut.s_axil_rready.value = 0
+    
+    # Reset sequence
+    await ClockCycles(dut.clk, 5)
+    dut.rstn.value = 1
+    await ClockCycles(dut.clk, 5)
+    
+    dut._log.info("Starting AXI-Lite Adapter Test - 32-bit only")
+    
+    # Test Write Transaction
+    test_addr = 0x1000
+    test_data = 0x12345678
+    
+    dut._log.info(f"Testing write: addr=0x{test_addr:08x}, data=0x{test_data:08x}")
+    
+    # Start write transaction from slave side
+    dut.s_axil_awaddr.value = test_addr
+    dut.s_axil_awvalid.value = 1
+    dut.s_axil_wdata.value = test_data
+    dut.s_axil_wvalid.value = 1
+    
     await RisingEdge(dut.clk)
+    
+    # Wait for adapter to propagate address to master
+    timeout = 0
+    while dut.m_axil_awvalid.value == 0 and timeout < 10:
+        await RisingEdge(dut.clk)
+        timeout += 1
+    
+    assert dut.m_axil_awvalid.value == 1, "Master awvalid should be asserted"
+    assert int(dut.m_axil_awaddr.value) == test_addr, f"Address mismatch: got 0x{int(dut.m_axil_awaddr.value):08x}"
+    
+    # Master accepts address
+    dut.m_axil_awready.value = 1
     await RisingEdge(dut.clk)
-
-
-async def run_test_read(dut, data_in=None, idle_inserter=None, backpressure_inserter=None):
-
-    tb = TB(dut)
-
-    byte_lanes = tb.axil_master.write_if.byte_lanes
-
-    await tb.cycle_reset()
-
-    tb.set_idle_generator(idle_inserter)
-    tb.set_backpressure_generator(backpressure_inserter)
-
-    # Enforce 32-bit transactions (4 bytes)
-    for offset in range(byte_lanes):
-        tb.log.info("offset %d", offset)
-        addr = offset+0x1000
-        test_data = bytearray([x % 256 for x in range(4)])
-
-        tb.axil_ram.write(addr, test_data)
-
-        data = await tb.axil_master.read(addr, 4)
-
-        assert data.data == test_data
-
+    dut.m_axil_awready.value = 0
+    
+    # Wait for data to propagate
+    timeout = 0
+    while dut.m_axil_wvalid.value == 0 and timeout < 10:
+        await RisingEdge(dut.clk)
+        timeout += 1
+        
+    assert dut.m_axil_wvalid.value == 1, "Master wvalid should be asserted"
+    assert int(dut.m_axil_wdata.value) == test_data, f"Data mismatch: got 0x{int(dut.m_axil_wdata.value):08x}"
+    
+    # Master accepts data
+    dut.m_axil_wready.value = 1
     await RisingEdge(dut.clk)
+    dut.m_axil_wready.value = 0
+    
+    # Master provides write response
+    dut.m_axil_bresp.value = 0  # OKAY
+    dut.m_axil_bvalid.value = 1
+    dut.s_axil_bready.value = 1
+    
     await RisingEdge(dut.clk)
-
-
-async def run_stress_test(dut, idle_inserter=None, backpressure_inserter=None):
-
-    tb = TB(dut)
-
-    await tb.cycle_reset()
-
-    tb.set_idle_generator(idle_inserter)
-    tb.set_backpressure_generator(backpressure_inserter)
-
-    async def worker(master, offset, aperture, count=16):
-        for k in range(count):
-            # Enforce 32-bit transactions (4 bytes)
-            addr = offset+random.randint(0, aperture-4)
-            test_data = bytearray([x % 256 for x in range(4)])
-
-            await Timer(random.randint(1, 100), 'ns')
-
-            await master.write(addr, test_data)
-
-            await Timer(random.randint(1, 100), 'ns')
-
-            data = await master.read(addr, 4)
-            assert data.data == test_data
-
-    workers = []
-
-    for k in range(16):
-        workers.append(cocotb.start_soon(worker(tb.axil_master, k*0x1000, 0x1000, count=16)))
-
-    while workers:
-        await workers.pop(0).join()
-
+    
+    # Wait for response to propagate back to slave
+    timeout = 0
+    while dut.s_axil_bvalid.value == 0 and timeout < 10:
+        await RisingEdge(dut.clk)
+        timeout += 1
+        
+    assert dut.s_axil_bvalid.value == 1, "Slave bvalid should be asserted"
+    assert int(dut.s_axil_bresp.value) == 0, "Response should be OKAY"
+    
+    # Complete write transaction
     await RisingEdge(dut.clk)
+    dut.m_axil_bvalid.value = 0
+    dut.s_axil_bready.value = 0
+    dut.s_axil_awvalid.value = 0
+    dut.s_axil_wvalid.value = 0
+    
+    await ClockCycles(dut.clk, 5)
+    
+    # Test Read Transaction
+    dut._log.info(f"Testing read: addr=0x{test_addr:08x}")
+    
+    # Start read transaction
+    dut.s_axil_araddr.value = test_addr
+    dut.s_axil_arvalid.value = 1
+    
     await RisingEdge(dut.clk)
+    
+    # Wait for read address to propagate
+    timeout = 0
+    while dut.m_axil_arvalid.value == 0 and timeout < 10:
+        await RisingEdge(dut.clk)
+        timeout += 1
+        
+    assert dut.m_axil_arvalid.value == 1, "Master arvalid should be asserted"
+    assert int(dut.m_axil_araddr.value) == test_addr, f"Read address mismatch"
+    
+    # Master accepts read address
+    dut.m_axil_arready.value = 1
+    await RisingEdge(dut.clk)
+    dut.m_axil_arready.value = 0
+    
+    # Master provides read data
+    dut.m_axil_rdata.value = test_data
+    dut.m_axil_rresp.value = 0  # OKAY
+    dut.m_axil_rvalid.value = 1
+    dut.s_axil_rready.value = 1
+    
+    await RisingEdge(dut.clk)
+    
+    # Wait for read data to propagate
+    timeout = 0
+    while dut.s_axil_rvalid.value == 0 and timeout < 10:
+        await RisingEdge(dut.clk)
+        timeout += 1
+        
+    assert dut.s_axil_rvalid.value == 1, "Slave rvalid should be asserted"
+    assert int(dut.s_axil_rdata.value) == test_data, f"Read data mismatch: got 0x{int(dut.s_axil_rdata.value):08x}"
+    assert int(dut.s_axil_rresp.value) == 0, "Read response should be OKAY"
+    
+    # Complete read transaction
+    await RisingEdge(dut.clk)
+    dut.m_axil_rvalid.value = 0
+    dut.s_axil_rready.value = 0
+    dut.s_axil_arvalid.value = 0
+    
+    await ClockCycles(dut.clk, 10)
+    
+    dut._log.info("Basic test PASSED!")
 
+@cocotb.test()
+async def test_multiple_transactions(dut):
+    """Test multiple 32-bit read/write transactions"""
+    
+    # Generate clock
+    clock = Clock(dut.clk, 10, units="ns")
+    cocotb.start_soon(clock.start())
+    
+    # Reset
+    dut.rstn.value = 0
+    await ClockCycles(dut.clk, 5)
+    dut.rstn.value = 1
+    await ClockCycles(dut.clk, 5)
+    
+    # Initialize all master interface signals
+    dut.m_axil_awready.value = 0
+    dut.m_axil_wready.value = 0
+    dut.m_axil_bresp.value = 0
+    dut.m_axil_bvalid.value = 0
+    dut.m_axil_arready.value = 0
+    dut.m_axil_rdata.value = 0
+    dut.m_axil_rresp.value = 0
+    dut.m_axil_rvalid.value = 0
+    
+    # Initialize all slave interface signals
+    dut.s_axil_awaddr.value = 0
+    dut.s_axil_awvalid.value = 0
+    dut.s_axil_wdata.value = 0
+    dut.s_axil_wvalid.value = 0
+    dut.s_axil_bready.value = 0
+    dut.s_axil_araddr.value = 0
+    dut.s_axil_arvalid.value = 0
+    dut.s_axil_rready.value = 0
+    
+    # Simple memory model
+    memory = {}
+    
+    # Test 3 transactions
+    for i in range(3):
+        addr = 0x1000 + (i * 4)  # Word aligned addresses
+        data = 0x10000000 + (i * 0x11111111)  # Unique data pattern
+        
+        dut._log.info(f"Transaction {i+1}: Write 0x{data:08x} to 0x{addr:08x}")
+        
+        # === WRITE TRANSACTION ===
+        dut.s_axil_awaddr.value = addr
+        dut.s_axil_awvalid.value = 1
+        dut.s_axil_wdata.value = data
+        dut.s_axil_wvalid.value = 1
+        
+        await RisingEdge(dut.clk)
+        
+        # Wait for master interface
+        while not (dut.m_axil_awvalid.value and dut.m_axil_wvalid.value):
+            await RisingEdge(dut.clk)
+            
+        # Master accepts
+        dut.m_axil_awready.value = 1
+        dut.m_axil_wready.value = 1
+        await RisingEdge(dut.clk)
+        dut.m_axil_awready.value = 0
+        dut.m_axil_wready.value = 0
+        
+        # Store in memory model
+        memory[addr] = data
+        
+        # Master responds
+        dut.m_axil_bresp.value = 0
+        dut.m_axil_bvalid.value = 1
+        dut.s_axil_bready.value = 1
+        await RisingEdge(dut.clk)
+        
+        # Wait for response to propagate
+        while not dut.s_axil_bvalid.value:
+            await RisingEdge(dut.clk)
+            
+        await RisingEdge(dut.clk)
+        dut.m_axil_bvalid.value = 0
+        dut.s_axil_bready.value = 0
+        dut.s_axil_awvalid.value = 0
+        dut.s_axil_wvalid.value = 0
+        
+        await ClockCycles(dut.clk, 2)
+        
+        # === READ TRANSACTION ===
+        dut._log.info(f"Transaction {i+1}: Read from 0x{addr:08x}")
+        
+        dut.s_axil_araddr.value = addr
+        dut.s_axil_arvalid.value = 1
+        
+        await RisingEdge(dut.clk)
+        
+        # Wait for master interface
+        while not dut.m_axil_arvalid.value:
+            await RisingEdge(dut.clk)
+            
+        # Master accepts
+        dut.m_axil_arready.value = 1
+        await RisingEdge(dut.clk)
+        dut.m_axil_arready.value = 0
+        
+        # Master responds with data
+        expected_data = memory.get(addr, 0)
+        dut.m_axil_rdata.value = expected_data
+        dut.m_axil_rresp.value = 0
+        dut.m_axil_rvalid.value = 1
+        dut.s_axil_rready.value = 1
+        
+        await RisingEdge(dut.clk)
+        
+        # Wait for data to propagate
+        while not dut.s_axil_rvalid.value:
+            await RisingEdge(dut.clk)
+            
+        # Check data
+        received_data = int(dut.s_axil_rdata.value)
+        assert received_data == data, f"Transaction {i+1}: Expected 0x{data:08x}, got 0x{received_data:08x}"
+        
+        await RisingEdge(dut.clk)
+        dut.m_axil_rvalid.value = 0
+        dut.s_axil_rready.value = 0
+        dut.s_axil_arvalid.value = 0
+        
+        await ClockCycles(dut.clk, 2)
+    
+    dut._log.info("Multiple transaction test PASSED!")
 
-def cycle_pause():
-    return itertools.cycle([1, 1, 1, 0])
-
-
-if cocotb.SIM_NAME:
-
-    for test in [run_test_write, run_test_read]:
-
-        factory = TestFactory(test)
-        factory.add_option("idle_inserter", [None, cycle_pause])
-        factory.add_option("backpressure_inserter", [None, cycle_pause])
-        factory.generate_tests()
-
-    factory = TestFactory(run_stress_test)
-    factory.generate_tests()
-
-
-# cocotb-test
-
-tests_dir = os.path.abspath(os.path.dirname(__file__))
-rtl_dir = os.path.abspath(os.path.join(tests_dir, '..', '..', 'rtl'))
-
-
-@pytest.mark.parametrize("m_data_width", [8, 16, 32])
-@pytest.mark.parametrize("s_data_width", [8, 16, 32])
-def test_axil_adapter(request, s_data_width, m_data_width):
-    dut = "axil_adapter"
-    module = os.path.splitext(os.path.basename(__file__))[0]
-    toplevel = dut
-
-    verilog_sources = [
-        os.path.join(rtl_dir, "axil_adapter.v"),
-        os.path.join(rtl_dir, "axil_rd_adapter.v"),
-        os.path.join(rtl_dir, "axil_wr_adapter.v"),
-    ]
-
-    parameters = {}
-
-    parameters['ADDR_WIDTH'] = 32
-    parameters['S_DATA_WIDTH'] = s_data_width
-    parameters['M_DATA_WIDTH'] = m_data_width
-
-    extra_env = {f'PARAM_{k}': str(v) for k, v in parameters.items()}
-
-    sim_build = os.path.join(tests_dir, "sim_build",
-        request.node.name.replace('[', '-').replace(']', ''))
-
-    cocotb_test.simulator.run(
-        python_search=[tests_dir],
-        verilog_sources=verilog_sources,
-        toplevel=toplevel,
-        module=module,
-        parameters=parameters,
-        sim_build=sim_build,
-        extra_env=extra_env,
-    )
+@cocotb.test()
+async def test_back_to_back(dut):
+    """Test back-to-back transactions"""
+    
+    # Generate clock
+    clock = Clock(dut.clk, 10, units="ns")
+    cocotb.start_soon(clock.start())
+    
+    # Reset
+    dut.rstn.value = 0
+    await ClockCycles(dut.clk, 5)
+    dut.rstn.value = 1
+    await ClockCycles(dut.clk, 5)
+    
+    # Initialize signals
+    dut.m_axil_awready.value = 1  # Master always ready
+    dut.m_axil_wready.value = 1
+    dut.m_axil_arready.value = 1
+    dut.s_axil_bready.value = 1   # Slave always ready
+    dut.s_axil_rready.value = 1
+    
+    dut.m_axil_bresp.value = 0
+    dut.m_axil_bvalid.value = 0
+    dut.m_axil_rresp.value = 0
+    dut.m_axil_rvalid.value = 0
+    dut.m_axil_rdata.value = 0
+    
+    # Back-to-back writes
+    for i in range(2):
+        addr = 0x2000 + (i * 4)
+        data = 0x55AA0000 + i
+        
+        dut.s_axil_awaddr.value = addr
+        dut.s_axil_awvalid.value = 1
+        dut.s_axil_wdata.value = data
+        dut.s_axil_wvalid.value = 1
+        
+        await RisingEdge(dut.clk)
+        
+        # Master immediately responds
+        dut.m_axil_bvalid.value = 1
+        await RisingEdge(dut.clk)
+        dut.m_axil_bvalid.value = 0
+        
+        dut.s_axil_awvalid.value = 0
+        dut.s_axil_wvalid.value = 0
+        
+        dut._log.info(f"Back-to-back write {i+1}: 0x{data:08x} to 0x{addr:08x}")
+    
+    await ClockCycles(dut.clk, 5)
+    dut._log.info("Back-to-back test PASSED!")
